@@ -28,7 +28,6 @@ HELP.md
 
 ### VS Code ###
 .vscode/
-go.sum
 .env
 init-mock-db.sql
 makefile
