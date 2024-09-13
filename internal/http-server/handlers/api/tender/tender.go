@@ -1,6 +1,8 @@
 package tender
 
 import (
+	"encoding/json"
+	serrors "errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -8,17 +10,23 @@ import (
 	"tender_system/internal/lib/errors"
 	"tender_system/internal/models/tender"
 	"tender_system/internal/models/user"
+	"tender_system/internal/storage/postgres"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/render"
+	"github.com/go-playground/validator/v10"
 )
+
+var validate = validator.New()
 
 type TenderSaver interface {
 	SaveTender(ten tender.TenderRequest) (tender.TenderResponse, error)
+	CheckOrganizationResponsible(username, organization_id string) (bool, error)
 }
 
 type TenderGetter interface {
-	ReadTenders(limit, offset int) ([]tender.TenderResponse, error)
+	ReadTenders(limit, offset int, serviceType string) ([]tender.TenderResponse, error)
+	FetchUserOrganization(username string) (string, error)
 }
 
 type MyTenderGetter interface {
@@ -30,7 +38,7 @@ type MyTenderGetter interface {
 type TenderStatusGetter interface {
 	FetchUser(username string) (user.User, error)
 	FetchUserOrganization(username string) (string, error)
-	ReadTenderStatus(tenderId string) (string, string, error)
+	ReadTenderStatus(tenderId, username string) (string, error)
 }
 
 type TenderStatusPutter interface {
@@ -54,6 +62,14 @@ type TendetRollerBack interface {
 func NewGetTenders(log *slog.Logger, tenderGetter TenderGetter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var limit, offset int
+		serviceType := r.URL.Query().Get("service_type")
+		if err := validateServiceType(serviceType); err != nil && serviceType != "" {
+			log.Error("Incorrect service type")
+			render.Status(r, 400)
+			render.JSON(w, r, errors.NewHttpError("Incorrect service type"))
+			return
+		}
+
 		var err error
 		if r.URL.Query().Get("limit") == "" {
 			limit = 5
@@ -78,7 +94,7 @@ func NewGetTenders(log *slog.Logger, tenderGetter TenderGetter) http.HandlerFunc
 			}
 		}
 
-		resp, err := tenderGetter.ReadTenders(limit, offset)
+		resp, err := tenderGetter.ReadTenders(limit, offset, serviceType)
 		if err != nil {
 			log.Error("Failed to read tenders", slog.Attr{Key: "error", Value: slog.StringValue(err.Error())})
 			render.Status(r, 500)
@@ -95,20 +111,45 @@ func NewPostTender(log *slog.Logger, tenderSaver TenderSaver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req tender.TenderRequest
 
-		err := render.DecodeJSON(r.Body, &req)
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+
+		err := decoder.Decode(&req)
 		if err != nil {
-			log.Error("Failed to decode request body")
+			log.Error("Unknown Fields in request body")
 			render.Status(r, 400)
-			render.JSON(w, r, errors.NewHttpError("Failed to decode request body"))
+			render.JSON(w, r, errors.NewHttpError(err.Error()))
 			return
 		}
 
 		//TODO: Validate serviceType and other fields to be non-null
 
+		err = validate.Struct(req)
+		if err != nil {
+			render.Status(r, 400)
+			render.JSON(w, r, errors.NewHttpError("One of the fields is empty"))
+			return
+		}
+
+		err = validateServiceType(req.ServiceType)
+		if err != nil {
+			render.Status(r, 400)
+			render.JSON(w, r, errors.NewHttpError("Incorrect Service Type"))
+			return
+		}
+
 		resp, err := tenderSaver.SaveTender(req)
 		if err != nil {
-			log.Error("Failed to save tender", slog.Attr{Key: "error", Value: slog.StringValue(err.Error())})
-			render.Status(r, 500)
+			switch {
+			case serrors.Is(err, postgres.ErrBadRequest):
+				render.Status(r, 400)
+			case serrors.Is(err, postgres.ErrUserNotFound):
+				render.Status(r, 401)
+			case serrors.Is(err, postgres.ErrForbidden):
+				render.Status(r, 403)
+			default:
+				render.Status(r, 400)
+			}
 			render.JSON(w, r, errors.NewHttpError(err.Error()))
 			return
 		}
@@ -123,6 +164,7 @@ func NewGetMyTenders(log *slog.Logger, myTenderGetter MyTenderGetter) http.Handl
 		if username == "" {
 			render.Status(r, 401)
 			render.JSON(w, r, errors.NewHttpError("The Username is empty"))
+			return
 		}
 
 		var limit, offset int
@@ -150,25 +192,8 @@ func NewGetMyTenders(log *slog.Logger, myTenderGetter MyTenderGetter) http.Handl
 			}
 		}
 
-		_, err = myTenderGetter.FetchUser(username)
-		if err != nil {
-			log.Error("Incorrect user information", slog.Attr{Key: "error", Value: slog.StringValue(err.Error())})
-			render.Status(r, 401)
-			render.JSON(w, r, errors.NewHttpError("Incorrect user information"))
-			return
-		}
-
-		_, err = myTenderGetter.FetchUserOrganization(username)
-		if err != nil {
-			log.Error("User is not a responsible", slog.Attr{Key: "error", Value: slog.StringValue(err.Error())})
-			render.Status(r, 401)
-			render.JSON(w, r, errors.NewHttpError("User is not a responsible"))
-			return
-		}
-
 		resp, err := myTenderGetter.ReadMyTenders(username, limit, offset)
 		if err != nil {
-			log.Error("Error reading tenders", slog.Attr{Key: "error", Value: slog.StringValue(err.Error())})
 			render.Status(r, 401)
 			render.JSON(w, r, errors.NewHttpError(err.Error()))
 			return
@@ -181,11 +206,6 @@ func NewGetMyTenders(log *slog.Logger, myTenderGetter MyTenderGetter) http.Handl
 func NewGetTenderStatus(log *slog.Logger, tenderStatusGetter TenderStatusGetter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		username := r.URL.Query().Get("username")
-		if username == "" {
-			render.Status(r, 401)
-			render.JSON(w, r, errors.NewHttpError("The Username is empty"))
-			return
-		}
 
 		tenderId := chi.URLParam(r, "tenderId")
 		if tenderId == "" {
@@ -194,34 +214,21 @@ func NewGetTenderStatus(log *slog.Logger, tenderStatusGetter TenderStatusGetter)
 			return
 		}
 
-		_, err := tenderStatusGetter.FetchUser(username)
+		status, err := tenderStatusGetter.ReadTenderStatus(tenderId, username)
 		if err != nil {
-			log.Error("Incorrect user information", slog.Attr{Key: "error", Value: slog.StringValue(err.Error())})
-			render.Status(r, 401)
-			render.JSON(w, r, errors.NewHttpError("Incorrect user information"))
-			return
-		}
-
-		_, err = tenderStatusGetter.FetchUserOrganization(username)
-		if err != nil {
-			log.Error("User is not a responsible", slog.Attr{Key: "error", Value: slog.StringValue(err.Error())})
-			render.Status(r, 401)
-			render.JSON(w, r, errors.NewHttpError("User is not a responsible"))
-			return
-		}
-
-		status, name, err := tenderStatusGetter.ReadTenderStatus(tenderId)
-		if err != nil {
-			log.Error("Tender does not exist", slog.Attr{Key: "error", Value: slog.StringValue(err.Error())})
-			render.Status(r, 404)
-			render.JSON(w, r, errors.NewHttpError("Tender does not exist"))
-			return
-		}
-
-		if name != username {
-			log.Error("given user is not creator of this tender")
-			render.Status(r, 403)
-			render.JSON(w, r, errors.NewHttpError("given user is not creator of this tender"))
+			switch {
+			case serrors.Is(err, postgres.ErrBadRequest):
+				render.Status(r, 400)
+			case serrors.Is(err, postgres.ErrUserNotFound):
+				render.Status(r, 401)
+			case serrors.Is(err, postgres.ErrForbidden):
+				render.Status(r, 403)
+			case serrors.Is(err, postgres.ErrNotFound):
+				render.Status(r, 404)
+			default:
+				render.Status(r, 400)
+			}
+			render.JSON(w, r, errors.NewHttpError(err.Error()))
 			return
 		}
 
@@ -261,21 +268,21 @@ func NewPutTenderStatus(log *slog.Logger, tenderStatusPutter TenderStatusPutter)
 			return
 		}
 
-		_, err = tenderStatusPutter.FetchUserOrganization(username)
-		if err != nil {
-			log.Error("User is not a responsible", slog.Attr{Key: "error", Value: slog.StringValue(err.Error())})
-			render.Status(r, 401)
-			render.JSON(w, r, errors.NewHttpError("User is not a responsible"))
-			return
-		}
-
 		resp, err := tenderStatusPutter.UpdateTenderStatus(tenderId, status, username)
 		if err != nil {
-
-			//TODO: Add proper error handling
-			log.Error("Error putting status", slog.Attr{Key: "error", Value: slog.StringValue(err.Error())})
-			render.Status(r, 403)
-			render.JSON(w, r, errors.NewHttpError("Error putting status"))
+			switch {
+			case serrors.Is(err, postgres.ErrBadRequest):
+				render.Status(r, 400)
+			case serrors.Is(err, postgres.ErrUserNotFound):
+				render.Status(r, 401)
+			case serrors.Is(err, postgres.ErrForbidden):
+				render.Status(r, 403)
+			case serrors.Is(err, postgres.ErrNotFound):
+				render.Status(r, 404)
+			default:
+				render.Status(r, 400)
+			}
+			render.JSON(w, r, errors.NewHttpError(err.Error()))
 			return
 		}
 
@@ -300,47 +307,46 @@ func NewPatchTender(log *slog.Logger, tenderPatcher TenderPatcher) http.HandlerF
 		}
 
 		var patchRequest tender.TenderPatchRequest
-		err := render.DecodeJSON(r.Body, &patchRequest)
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+
+		err := decoder.Decode(&patchRequest)
 		if err != nil {
 			render.Status(r, 400)
 			render.JSON(w, r, errors.NewHttpError(err.Error()))
+			return
 		}
 		if patchRequest.Name == "" && patchRequest.Description == "" && patchRequest.ServiceType == "" {
 			render.Status(r, 400)
 			render.JSON(w, r, errors.NewHttpError("The request body is empty"))
+			return
 		}
 
 		if patchRequest.ServiceType != "" {
 			err := validateServiceType(patchRequest.ServiceType)
 			if err != nil {
 				log.Error("Value error", slog.Attr{Key: "error", Value: slog.StringValue(err.Error())})
-				render.Status(r, 401)
+				render.Status(r, 400)
 				render.JSON(w, r, errors.NewHttpError(err.Error()))
 				return
 			}
 		}
 
-		_, err = tenderPatcher.FetchUser(username)
-		if err != nil {
-			log.Error("Incorrect user information", slog.Attr{Key: "error", Value: slog.StringValue(err.Error())})
-			render.Status(r, 401)
-			render.JSON(w, r, errors.NewHttpError("Incorrect user information"))
-			return
-		}
-
-		_, err = tenderPatcher.FetchUserOrganization(username)
-		if err != nil {
-			log.Error("User is not a responsible", slog.Attr{Key: "error", Value: slog.StringValue(err.Error())})
-			render.Status(r, 401)
-			render.JSON(w, r, errors.NewHttpError("User is not a responsible"))
-			return
-		}
-
 		resp, err := tenderPatcher.PatchTender(tenderId, username, patchRequest.Name, patchRequest.Description, patchRequest.ServiceType)
 		if err != nil {
-			log.Error("Error patching tender", slog.Attr{Key: "error", Value: slog.StringValue(err.Error())})
-			render.Status(r, 401)
-			render.JSON(w, r, errors.NewHttpError("Error patching tender"))
+			switch {
+			case serrors.Is(err, postgres.ErrBadRequest):
+				render.Status(r, 400)
+			case serrors.Is(err, postgres.ErrUserNotFound):
+				render.Status(r, 401)
+			case serrors.Is(err, postgres.ErrForbidden):
+				render.Status(r, 403)
+			case serrors.Is(err, postgres.ErrNotFound):
+				render.Status(r, 404)
+			default:
+				render.Status(r, 400)
+			}
+			render.JSON(w, r, errors.NewHttpError(err.Error()))
 			return
 		}
 
@@ -372,27 +378,21 @@ func NewRollbackTender(log *slog.Logger, tenderRollerBack TendetRollerBack) http
 			return
 		}
 
-		_, err = tenderRollerBack.FetchUser(username)
-		if err != nil {
-			log.Error("Incorrect user information", slog.Attr{Key: "error", Value: slog.StringValue(err.Error())})
-			render.Status(r, 401)
-			render.JSON(w, r, errors.NewHttpError("Incorrect user information"))
-			return
-		}
-
-		_, err = tenderRollerBack.FetchUserOrganization(username)
-		if err != nil {
-			log.Error("User is not a responsible", slog.Attr{Key: "error", Value: slog.StringValue(err.Error())})
-			render.Status(r, 401)
-			render.JSON(w, r, errors.NewHttpError("User is not a responsible"))
-			return
-		}
-
 		resp, err := tenderRollerBack.RollbackTender(tenderId, username, intVersion)
 		if err != nil {
-			log.Error("Error rolling back", slog.Attr{Key: "error", Value: slog.StringValue(err.Error())})
-			render.Status(r, 401)
-			render.JSON(w, r, errors.NewHttpError("Error rolling back"))
+			switch {
+			case serrors.Is(err, postgres.ErrBadRequest):
+				render.Status(r, 400)
+			case serrors.Is(err, postgres.ErrUserNotFound):
+				render.Status(r, 401)
+			case serrors.Is(err, postgres.ErrForbidden):
+				render.Status(r, 403)
+			case serrors.Is(err, postgres.ErrNotFound):
+				render.Status(r, 404)
+			default:
+				render.Status(r, 400)
+			}
+			render.JSON(w, r, errors.NewHttpError(err.Error()))
 			return
 		}
 

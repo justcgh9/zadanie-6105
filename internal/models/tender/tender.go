@@ -3,11 +3,11 @@ package tender
 import "time"
 
 type TenderRequest struct {
-	Name            string `json:"name"`
-	Description     string `json:"description"`
-	ServiceType     string `json:"serviceType"`
-	OrganizationId  string `json:"organizationId"`
-	CreatorUsername string `json:"creatorUsername"`
+	Name            string `json:"name" validate:"required"`
+	Description     string `json:"description" validate:"required"`
+	ServiceType     string `json:"serviceType" validate:"required"`
+	OrganizationId  string `json:"organizationId" validate:"required"`
+	CreatorUsername string `json:"creatorUsername" validate:"required"`
 }
 
 type TenderResponse struct {
